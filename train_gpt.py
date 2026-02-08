@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from itertools import accumulate
+from itertools import accumulate, pairwise
 from pathlib import Path
 import gc
 
@@ -42,6 +42,20 @@ from triton_kernels import (
 )
 
 dynamo.config.recompile_limit = 64
+
+# -----------------------------------------------------------------------------
+# Distributed training setup
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+assert 8 % world_size == 0, "world_size must be a divisor of 8"
+grad_accum_steps = 8 // world_size
+grad_scale = 2 / grad_accum_steps # consistent grad magnitudes between different num_devices
+assert torch.cuda.is_available()
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -923,10 +937,11 @@ class CastedLinearT(nn.Module):
 
 
 class Yarn(nn.Module):
-    def __init__(self, head_dim, max_seq_len):
+    def __init__(self, head_dim, max_seq_len, paired=False):
         super().__init__()
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
+        self.paired = paired
         self.reset()
 
     def rotary(self, x_BTHD):
@@ -1059,12 +1074,13 @@ flash_attn_interface = get_kernel("varunneal/flash-attention-3").flash_attn_inte
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.dim = dim
         self.hdim = num_heads * head_dim
+        self.paired = paired
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         # Weights are stored in parameter banks and passed via forward()
 
@@ -1105,6 +1121,40 @@ class CausalSelfAttention(nn.Module):
             if self.training
             else (args.val_batch_size // (grad_accum_steps * world_size))
         )
+
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+
+        if not self.paired:
+            q, k = yarn.rotary(q), yarn.rotary(k)
+
+            if key_offset:
+                # shift keys forward for the stationary head dims. Enables 1-layer induction.
+                k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
+
+            if ve is not None:
+                ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
+                v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
+
+        else:
+            # Paired heads: adjacent heads' queries attend to each other's keys.
+            # Two copies of the input stream are interleaved to achieve this, which:
+            # - doubles the length of each sequence
+            # - halves the effective window size
+            q = q.view(B, T, self.num_heads // 2, self.head_dim * 2)
+            k = k.view(B, T, self.num_heads // 2, self.head_dim * 2)
+            v = v.reshape(B, T * 2, self.num_heads // 2, self.head_dim)
+
+            q, k = yarn.rotary(q), yarn.rotary(k)
+
+            q = q.view(B, T * 2, self.num_heads // 2, self.head_dim)
+            k = k.view(B, T * 2, self.num_heads // 2, self.head_dim)
+
+            if ve is not None:
+                ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T * 2, self.num_heads // 2, 1)
+                v = v + ve_gate_out * ve.view_as(v)
+
+            seqlens = 2 * seqlens
+            max_len = 2 * max_len
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
         y = flash_attn_interface.flash_attn_varlen_func(
@@ -1236,13 +1286,7 @@ class Block(nn.Module):
     ):
         super().__init__()
         # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
-        if has_attn:
-            if use_paired_head:
-                self.attn = PairedHeadCausalSelfAttention(dim, head_dim, num_heads)
-            else:
-                self.attn = CausalSelfAttention(dim, head_dim, num_heads)
-        else:
-            self.attn = None
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads, paired=use_paired_head) if has_attn else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP() if has_mlp else None
 
@@ -1288,7 +1332,7 @@ class GPT(nn.Module):
     ):
         super().__init__()
         self.num_layers = num_layers
-        vocab_size = next_multiple_of_n(vocab_size, n=128)
+        self.vocab_size = next_multiple_of_n(vocab_size, n=128)
 
         self.smear_gate = nn.Linear(12, 1, bias=False)
         nn.init.zeros_(self.smear_gate.weight)
@@ -1399,7 +1443,7 @@ class GPT(nn.Module):
             ]
         )
         self.yarn = Yarn(head_dim, max_seq_len)
-        self.yarn_paired_head = YarnPairedHead(head_dim, max_seq_len)
+        self.yarn_paired_head = Yarn(head_dim, max_seq_len, paired=True)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
@@ -1511,10 +1555,9 @@ class GPT(nn.Module):
         x0_bigram = self.bigram_embed(bigram_input_seq)[None]
 
         # Value embeddings - always computed (not precomputed)
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        # dropping first layer updates this to .12 ... 012
-        ve = [ve[1], ve[2]] + [None] * (self.num_layers - 5) + [ve[0], ve[1], ve[2]]
+        ve = self.value_embeds.view(5, self.vocab_size, -1)[:, input_seq]
+        # 01 ... 234 structure on token value embeddings by @photomz
+        ve = [ve[0], ve[1]] + [None] * (self.num_layers - 5) + [ve[2], ve[3], ve[4]]
         assert len(ve) == self.num_layers
 
         # smear token embed forward 1 position @classiclarryd
@@ -1673,7 +1716,7 @@ class BOSFinder:
             )
         self.i = 0
         self.world_size = world_size
-        self.batch_iter = 0
+        self.i = 0
 
     def _load(self):
         self.bos_idx_async = (
@@ -1685,16 +1728,15 @@ class BOSFinder:
         )
         self.ready.set()
 
-    def start(self):
-        self.ready.clear()
-        self.thread = threading.Thread(target=self._load)
-        self.thread.start()
+    def _scan(self):
+        self._full_idx = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self._ready.set()
 
-    def get(self):
-        if self.thread:
-            self.ready.wait()
-            self.thread.join()
-        self.bos_idx = self.bos_idx_async
+    def _maybe_switch(self):
+        # Switch to full index as soon as async scan completes
+        if self.bos_idx is not self._full_idx and self._ready.is_set():
+            self._loader_thread.join()
+            self.bos_idx = self._full_idx
 
     def next_batch(self, num_tokens_local: int, max_seq_len: int):
         # if quickload was used, repoint to the full dataset after 5 batches
@@ -1791,9 +1833,8 @@ def distributed_data_generator(
     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
     tokens = _load_data_shard(next(file_iter))
     if align_to_bos:
-        finder = BOSFinder(tokens, world_size=world_size, quickload=True)
-        preloader = DataPreloader(file_iter, world_size)
-        preloader.start()
+        shard = Shard(tokens, world_size)
+        next_shard_getter = Shard.load_async(next(file_iter), world_size)
     else:
         pos = 0  # for unaligned case
 
@@ -1812,8 +1853,12 @@ def distributed_data_generator(
                 )
             except StopIteration:
                 # This shard is exhausted, load the next one in the next loop iteration.
-                tokens, finder = preloader.get()
-                preloader.start()
+                shard = next_shard_getter()
+                tokens = shard.tokens
+                try:
+                    next_shard_getter = Shard.load_async(next(file_iter), world_size)
+                except StopIteration:
+                    next_shard_getter = None  # no more shards to preload
                 continue
 
             buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
@@ -1904,7 +1949,21 @@ def get_lr(step: int):
         w = (1 - x) / args.cooldown_frac
         lr = lr_max * w + (1 - w) * 0.1
         return lr
-    return lr_max
+
+# window_sizes are in units of `block_size` tokens (defined in TrainingManager)
+TRAINING_STAGES = [
+    TrainingStage(duration=1/3, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
+                  mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
+    TrainingStage(duration=1/3, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
+                  mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
+    TrainingStage(duration=1/3, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
+                  mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
+    # extension stage
+    TrainingStage(batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
+                  mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
+]
+
+training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
 
 
 def get_muon_momentum(
@@ -1916,7 +1975,7 @@ def get_muon_momentum(
 ):
     # warmup phase: linearly increase momentum from min to max
     # cooldown phase: linearly decrease momentum from max to min
-    momentum_cd_start = args.num_iterations - muon_cooldown_steps
+    momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
     if step < muon_warmup_steps:
         frac = step / muon_warmup_steps
         momentum = momentum_min + frac * (momentum_max - momentum_min)
@@ -1931,26 +1990,15 @@ def get_muon_momentum(
 class TrainingManager:
     """
     Manages the NorMuonAndAdam for all parameters with explicit ordering.
-    Notable Features:
         1. Scalars are given higher momentum terms to smooth learning @ChrisJMcCormick
         2. Adam optimizers are only stepped on odd steps @classiclarryd
         3. Explicit scatter_order and work_order for communication scheduling (no backward hooks)
         4. Muon has a linear momentum warmup and cooldown schedule
         5. Learning rates follow a linear decay schedule
         6. Embed is tied to lm_head until split step (2/3 of training), then untied @classiclarryd
-
-    Manages model architecture, data, and target that changes during training
-    Notable Features:
-        1. Multi Token Prediction schedule of [1, 0.5, 0.25->0] -> [1, 0.5->0] -> [1] @varunneal
-        2. Sliding Attention window schedule of [1,3] -> [3,7] -> [5,11] -> [6,13]
-        3. YaRN updates to RoPE on window changes
-        4. Split embed and lm_head at 2/3 of training (weights and optimizer state copied)
-        5. Batch size schedule of 8 -> 16 -> 24
-        6. Post training extension of long windows from 13 to 20
     """
 
     def __init__(self, model):
-        self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
 
         # - Ordering dictates when to launch reduce/reduce_scatter operations
@@ -2105,7 +2153,7 @@ class TrainingManager:
         return mtp_weights_schedule
 
     def apply_final_ws_ext(self):
-        self.ws_long = args.ws_validate_post_yarn_ext
+        self.ws_long = training_schedule.ws_post_yarn_ext
 
     def get_forward_args(self):
         return ForwardScheduleConfig(
@@ -2117,22 +2165,16 @@ class TrainingManager:
         return step % 2 == 1
 
     def get_transition_steps(self):
-        transition_steps = []
-        ws_short, ws_long = get_ws(0)
-        for step in range(1, args.num_iterations):
-            ws_short, new_ws_long = get_ws(step)
-            if new_ws_long != ws_long:
-                transition_steps.append(step)
-                ws_long = new_ws_long
-        return transition_steps
+        return [start for start, _ in training_schedule.boundaries[1:]]
 
     def advance_schedule(self, step: int):
-        self.ws_short, new_ws_long = get_ws(step)
+        stage, _ = training_schedule.lookup(step)
+        self.ws_short, new_ws_long = stage.window_sizes
         if new_ws_long != self.ws_long:
-            self.model.yarn.apply(self.ws_long, new_ws_long)
-            self.model.yarn_paired_head.apply(self.ws_long, new_ws_long)
+            self.model.yarn.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
+            self.model.yarn_paired_head.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
 
-        new_batch_size = get_bs(step)
+        new_batch_size = stage.batch_size
         if new_batch_size != self.batch_size:
             self.train_loader_send_args = (
                 new_batch_size,
@@ -2147,7 +2189,7 @@ class TrainingManager:
         self.mtp_weights = self.mtp_weights_schedule[step]
 
     def step_optimizers(self, step: int):
-        step_lr = get_lr(step)
+        step_lr = training_schedule.get_lr(step)
         muon_momentum = get_muon_momentum(step)
         do_adam = self._is_adam_step(step)
 
@@ -2171,8 +2213,9 @@ class TrainingManager:
         # Reset NorMuon momentum buffers and split_embed state
         self.optimizer.reset()
 
-        self.ws_short, self.ws_long = get_ws(0)
-        self.batch_size = get_bs(0)
+        stage, _ = training_schedule.lookup(0)
+        self.ws_short, self.ws_long = stage.window_sizes
+        self.batch_size = stage.batch_size
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
 
@@ -2389,7 +2432,7 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
-train_steps = args.num_iterations
+train_steps = training_schedule.total_steps
 for step in range(train_steps + 1):
     last_step = step == train_steps
     training_manager.advance_schedule(step)
