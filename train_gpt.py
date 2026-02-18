@@ -49,13 +49,15 @@ rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
 grad_accum_steps = 8 // world_size
-grad_scale = 2 / grad_accum_steps # consistent grad magnitudes between different num_devices
+grad_scale = (
+    2 / grad_accum_steps
+)  # consistent grad magnitudes between different num_devices
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
-master_process = (rank == 0) # this process will do logging, checkpointing etc.
+master_process = rank == 0  # this process will do logging, checkpointing etc.
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -1122,18 +1124,20 @@ class CausalSelfAttention(nn.Module):
             else (args.val_batch_size // (grad_accum_steps * world_size))
         )
 
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = norm(q), norm(k)  # QK norm @Grad62304977
 
         if not self.paired:
             q, k = yarn.rotary(q), yarn.rotary(k)
 
             if key_offset:
                 # shift keys forward for the stationary head dims. Enables 1-layer induction.
-                k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
+                k[:, 1:, :, self.head_dim // 2 :] = k[:, :-1, :, self.head_dim // 2 :]
 
             if ve is not None:
-                ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
-                v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
+                ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(
+                    B, T, self.num_heads, 1
+                )
+                v = v + ve_gate_out * ve.view_as(v)  # @ KoszarskyB & @Grad62304977
 
         else:
             # Paired heads: adjacent heads' queries attend to each other's keys.
@@ -1150,7 +1154,9 @@ class CausalSelfAttention(nn.Module):
             k = k.view(B, T * 2, self.num_heads // 2, self.head_dim)
 
             if ve is not None:
-                ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T * 2, self.num_heads // 2, 1)
+                ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(
+                    B, T * 2, self.num_heads // 2, 1
+                )
                 v = v + ve_gate_out * ve.view_as(v)
 
             seqlens = 2 * seqlens
@@ -1286,7 +1292,11 @@ class Block(nn.Module):
     ):
         super().__init__()
         # skip attention of blocks.6 (the 7th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads, paired=use_paired_head) if has_attn else None
+        self.attn = (
+            CausalSelfAttention(dim, head_dim, num_heads, paired=use_paired_head)
+            if has_attn
+            else None
+        )
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP() if has_mlp else None
 
@@ -1729,7 +1739,13 @@ class BOSFinder:
         self.ready.set()
 
     def _scan(self):
-        self._full_idx = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self._full_idx = (
+            (self.tokens == BOS_ID)
+            .nonzero(as_tuple=True)[0]
+            .to(torch.int64)
+            .cpu()
+            .numpy()
+        )
         self._ready.set()
 
     def _maybe_switch(self):
@@ -1950,20 +1966,49 @@ def get_lr(step: int):
         lr = lr_max * w + (1 - w) * 0.1
         return lr
 
+
 # window_sizes are in units of `block_size` tokens (defined in TrainingManager)
 TRAINING_STAGES = [
-    TrainingStage(duration=1/3, batch_size=8 * 2048 * 8, window_sizes=(1, 3), lr_mul=1.0,
-                  mtp_weights_start=[1.0, 0.5, 0.25], mtp_weights_end=[1.0, 0.5, 0.0]),
-    TrainingStage(duration=1/3, batch_size=16 * 2048 * 8, window_sizes=(3, 7), lr_mul=1.52,  # (16/8)**0.6
-                  mtp_weights_start=[1.0, 0.5], mtp_weights_end=[1.0, 0.0]),
-    TrainingStage(duration=1/3, batch_size=24 * 2048 * 8, window_sizes=(5, 11), lr_mul=1.73,  # (24/8)**0.5
-                  mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
+    TrainingStage(
+        duration=1 / 3,
+        batch_size=8 * 2048 * 8,
+        window_sizes=(1, 3),
+        lr_mul=1.0,
+        mtp_weights_start=[1.0, 0.5, 0.25],
+        mtp_weights_end=[1.0, 0.5, 0.0],
+    ),
+    TrainingStage(
+        duration=1 / 3,
+        batch_size=16 * 2048 * 8,
+        window_sizes=(3, 7),
+        lr_mul=1.52,  # (16/8)**0.6
+        mtp_weights_start=[1.0, 0.5],
+        mtp_weights_end=[1.0, 0.0],
+    ),
+    TrainingStage(
+        duration=1 / 3,
+        batch_size=24 * 2048 * 8,
+        window_sizes=(5, 11),
+        lr_mul=1.73,  # (24/8)**0.5
+        mtp_weights_start=[1.0],
+        mtp_weights_end=[1.0],
+    ),
     # extension stage
-    TrainingStage(batch_size=24 * 2048 * 8, window_sizes=(6, 13), lr_mul=1.0,  # lr_mul is not used
-                  mtp_weights_start=[1.0], mtp_weights_end=[1.0]),
+    TrainingStage(
+        batch_size=24 * 2048 * 8,
+        window_sizes=(6, 13),
+        lr_mul=1.0,  # lr_mul is not used
+        mtp_weights_start=[1.0],
+        mtp_weights_end=[1.0],
+    ),
 ]
 
-training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, cooldown_frac=0.55)
+training_schedule = TrainingSchedule(
+    TRAINING_STAGES,
+    args.num_scheduled_iterations,
+    args.num_extension_iterations,
+    cooldown_frac=0.55,
+)
 
 
 def get_muon_momentum(
@@ -2171,8 +2216,12 @@ class TrainingManager:
         stage, _ = training_schedule.lookup(step)
         self.ws_short, new_ws_long = stage.window_sizes
         if new_ws_long != self.ws_long:
-            self.model.yarn.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
-            self.model.yarn_paired_head.apply(self.ws_long * self.block_size, new_ws_long * self.block_size)
+            self.model.yarn.apply(
+                self.ws_long * self.block_size, new_ws_long * self.block_size
+            )
+            self.model.yarn_paired_head.apply(
+                self.ws_long * self.block_size, new_ws_long * self.block_size
+            )
 
         new_batch_size = stage.batch_size
         if new_batch_size != self.batch_size:

@@ -26,6 +26,30 @@ torch._inductor.config.coordinate_descent_tuning = (
     True  # turn this off for a faster compile time (but slightly slower run)
 )
 
+
+# TODO: notes
+# within Muon
+# alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
+# x = self.lambdas[0] * x + self.lambdas[1] * x0
+# if self.attn is not None:
+#     x = x + self.attn(norm(x), ve, block_mask)
+#     # similar to pre activation resnet. i wonder what this means for lr.
+# x = x + self.mlp(norm(x))
+
+# think about lr for pre activation resnet
+# logits = 30 * torch.sigmoid(logits.float() / 7.5)
+# loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq)
+
+# every gpu has p.g and p's update_g, but momentum and Muon computation are split
+# every gpu loads all the tokens, but use only a part of it.
+# every gpu initializes model weights but a broadcast makes them all the safe
+# during train, all_reduce on p.g.
+# during val, all_reduce on loss.
+# torch.distributed.broadcast / all_reduce on a Parameter (requires_grad=True) are not autograd-friendly by default.
+# only use on requires_grad = False params.
+# think about gating mechanism as a fundamental building block.
+
+
 # -----------------------------------------------------------------------------
 # Custom operators : FP8 matmul for lm_head by @YouJiacheng
 
@@ -238,7 +262,6 @@ class Muon(torch.optim.Optimizer):
                     p_world.add_(
                         g_world.view_as(p_world),
                         # lr depends on input and output channels
-                        # TODO: this is important
                         alpha=-lr * max(1, p_world.size(-2) / p_world.size(-1)) ** 0.5,
                     )
 
@@ -353,7 +376,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj.weight.detach().zero_()  # zero init suggested by @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        self.attn_scale = 0.12  # TODO: check this
+        self.attn_scale = 0.12  # 1/sqrt(d) by default. the scale before softmax
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1)  # batch size, sequence length
@@ -366,18 +389,18 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k)  # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
+            # the shape of ve is B,T,dim. dim = head_dim * num_heads
             v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(
                 v
             )  # @KoszarskyB & @Grad62304977
         else:  # skip mid-layers token value embeddings by @YouJiacheng
-            # TODO: the size of v is halved in this case if lambdas is not modified
-            # TODO: what's the shape of ve
+            # TODO: the size of v is halved. lambda is not modified
             v = self.lambdas[0] * v
         y = flex_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
-            block_mask=block_mask,  # TODO: check this
+            block_mask=block_mask,
             scale=self.attn_scale,
         ).transpose(1, 2)
         y = y.contiguous().view(
@@ -415,10 +438,11 @@ class Block(nn.Module):
         self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
+        # lambdas[1] is 0.
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
             x = x + self.attn(norm(x), ve, block_mask)
-            # TODO: similar to pre activation resnet. i wonder what this means for lr.
+            # similar to pre activation resnet.
         x = x + self.mlp(norm(x))
         return x
 
@@ -457,6 +481,16 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 
+# there are two types of skip connections
+# one is the separate learnable value embedding added to the v in qkv.
+# the other is the output of one block added to the input of another block.
+
+
+# types of norms used
+# norm for QK in qkv.
+# norm in the split branch for attention and mlp.
+# norm for the input value embedding.
+# norm before the last linear layer.
 class GPT(nn.Module):
     def __init__(
         self,
@@ -482,7 +516,6 @@ class GPT(nn.Module):
             num_layers - self.num_encoder_layers
         )  # Remaining for decoder
         # Add learnable skip connection weights for decoder layers
-        # TODO: check this
         self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -576,7 +609,7 @@ class GPT(nn.Module):
         block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm]
         assert len(block_masks) == self.num_encoder_layers
         for i in range(self.num_encoder_layers):
-            # TODO: x vs v0
+            # x0 would be the skip connection, but this is not used.
             x = self.blocks[i](x, ve_enc[i], x0, block_masks[i])
             skip_connections.append(x)
         # Decoder pass - process the remaining blocks with weighted skip connections
@@ -584,6 +617,7 @@ class GPT(nn.Module):
         assert len(block_masks) == self.num_decoder_layers
         for i in range(self.num_decoder_layers):
             # seems stupid to me
+            # skip weights is 1.
             x = x + self.skip_weights[i] * skip_connections.pop()
             x = self.blocks[self.num_encoder_layers + i](
                 x, ve_dec[i], x0, block_masks[i]
@@ -632,6 +666,7 @@ def distributed_data_generator(
         # TODO: i think it should be > instead of >=
         if pos + batch_size + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
+        # even sliding window with long context is better than short context cuz short context chops off useful context
         buf = tokens[pos + rank * local_batch_size :][: local_batch_size + 1]
         inputs = buf[:-1].to(
             device="cuda", dtype=torch.int32, non_blocking=True
@@ -647,6 +682,8 @@ def distributed_data_generator(
 # int main
 
 
+# does every token exist on every gpu? or is that split
+# A: i think it's split
 @dataclass
 class Hyperparameters:
     # data
@@ -723,17 +760,18 @@ train_batch_size = world_size * args.seq_len
 train_loader = distributed_data_generator(
     args.train_files, train_batch_size, rank, world_size
 )
-
 model: nn.Module = GPT(
     vocab_size=50257,
     num_layers=12,
     num_heads=6,
-    model_dim=768,
+    model_dim=768,  # 128 head_dim * 6 heads = 768
     max_seq_len=max(args.seq_len, args.val_seq_len),
 ).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
+# TODO: find a way to print the model
+# param weights are initialized to different values at the start, and this broadcast makes them all the same
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -818,6 +856,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 x, y = next(val_loader)
+                # val loss is cross entropy.
                 val_loss += model(x, y, sw_num_blks(window_size))
         val_loss /= val_steps
         del val_loader

@@ -477,6 +477,9 @@ class Muon(torch.optim.Optimizer):
                     grad = params[base_i + rank].grad
                 # This gives strange dynamo warnings
                 reduce_scatter_futures.append(
+                    # this updates p.grad to the averaged p.grad across gpus.
+                    # each gpu only stores 1/8 of the averaged p.grad
+                    # each gpu updates 1/8 of the params and uses all_gather to get all updated params.
                     dist.reduce_scatter(
                         grad,
                         grad_pad[base_i : base_i + world_size],
@@ -500,6 +503,7 @@ class Muon(torch.optim.Optimizer):
                         * max(1, p.size(-2) / p.size(-1)) ** 0.5
                         * getattr(p, "lr_mul", 1.0)
                     )
+                    # TODO: effective wd doesn't depend on lr_mul.
                     eff_weight_decay = (
                         group["lr"] * group["weight_decay"] * getattr(p, "wd_mul", 1.0)
                     )
@@ -589,6 +593,7 @@ class DistAdam(torch.optim.Optimizer):
                 t = state["step"]
                 # weight decay
                 if wd != 0:
+                    # Adan differs from Muon in that its wd uses the effective lr instead of the original lr.
                     eff_weight_decay = lr * wd * getattr(p, "wd_mul", 1.0)
                     p_slice.mul_(1 - eff_weight_decay)
                 # update running averages
@@ -739,15 +744,20 @@ class CausalSelfAttention(nn.Module):
             q[0],
             k[0],
             v[0],
+            # cumulative sequence-length offsets (prefix sums)
+            # telling FlashAttention where each sequence starts/ends in the packed tensor.
             cu_seqlens_q=seqlens,
             cu_seqlens_k=seqlens,
+            # longest sequence length in the packed batch (used for kernel setup)
             max_seqlen_q=max_len,
             max_seqlen_k=max_len,
             causal=True,
             softmax_scale=self.attn_scale,
+            # each token can look back up to bm_size tokens and not look ahead
             window_size=(bm_size, 0),
         )
         y = y.view(B, T, self.num_heads, self.head_dim)
+        # TODO: new gating. 12 -> 6 linear. each head gets a sigmoid gate.
         y = y * torch.sigmoid(self.attn_gate(x[..., : self.attn_gate_dim])).view(
             B, T, self.num_heads, 1
         )
@@ -858,14 +868,14 @@ class GPT(nn.Module):
         self.scalars = nn.Parameter(
             torch.cat(
                 [
-                    torch.ones(num_layers),  # skip_weights
+                    torch.ones(num_layers),  # skip_weights, skip connection
                     *[
                         torch.tensor([1.0, 0.0]) for _ in range(num_layers)
-                    ],  # block lambdas
+                    ],  # block lambdas, add x0
                     *[
                         torch.tensor([0.5, 0.5]) for _ in range(num_layers)
-                    ],  # SA lambdas
-                    torch.ones(pad),
+                    ],  # SA lambdas, value embedding
+                    torch.ones(pad),  # pad 4 to make 64.
                 ]
             )
         )
@@ -888,7 +898,7 @@ class GPT(nn.Module):
             + [ve[0], ve[1], ve[2]]
         )
         assert len(ve) == len(self.blocks)
-
+        # ws is 3,7,11. block_size = 128
         long_bm, short_bm = ws * args.block_size, (ws // 2) * args.block_size
         bm_sizes = [
             long_bm,
@@ -931,11 +941,13 @@ class GPT(nn.Module):
         logits = self.lm_head(x).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
+        # TODO: BOS is predicted.
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             target_seq,
             reduction="sum" if self.training else "mean",
         )
+        # TODO: ce now uses sum instead of mean.
         return loss
 
 
@@ -963,6 +975,7 @@ def _load_data_shard(file: Path):
 BOS_ID = 50256
 
 
+# TODO: does the model predict the BOS token?
 class BOSFinder:
     # Helper for getting sequences that start at the beginning of documents by @varunneal based on work by @classiclarryd
     def __init__(self, tokens: Tensor, world_size: int = 1):
@@ -1043,6 +1056,7 @@ def distributed_data_generator(
                 )
             except StopIteration:
                 # This shard is exhausted, load the next one in the next loop iteration.
+                # TODO: if the current file does not have enough tokens left, they are discarded instead of kept.
                 tokens = _load_data_shard(next(file_iter))
                 finder = BOSFinder(tokens, world_size=world_size)
                 continue
@@ -1050,9 +1064,8 @@ def distributed_data_generator(
             buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
             _inputs = buf[:-1]
             _targets = buf[1:]
-            end_idxs[-1] -= (
-                1  # last document was too long to account for _targets offset
-            )
+            # cum_lengths is about the input to the attention, with no visibiilty into targets.
+            end_idxs[-1] -= 1
             cum_lengths = (end_idxs - start_idxs).cumsum(0)
 
         else:
@@ -1080,13 +1093,15 @@ def distributed_data_generator(
             _targets.to(device="cuda", dtype=torch.int64, non_blocking=True),
             _cum_lengths.to(device="cuda", dtype=torch.int32, non_blocking=True),
         )
-
+        # batch = next(gen) yields tensors, new_params is not set yet.
+        # batch = gen.send((a,b,c)) resumes, and inside generator new_params becomes (a,b,c)
         if new_params is not None:
             # makes it possible for generator to receive new (num_tokens, max_seq_len, grad_accum_steps) via .send()
             new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
             assert new_num_tokens % (world_size * grad_accum_steps) == 0, (
                 "Num tokens must be divisible by world size"
             )
+            # num_tokens = num_tokens // grad_accum_steps is not here
             num_tokens = new_num_tokens
             max_seq_len = new_max_seq_len
             grad_accum_steps = new_grad_accum_steps
@@ -1104,9 +1119,9 @@ class Hyperparameters:
         "data/fineweb10B/fineweb_val_*.bin"  # input .bin to eval validation loss on
     )
     val_tokens: int = 10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_batch_size: int = 2048 * 24 * 8
-    train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    train_batch_size: int = 2048 * 24 * 8  # num_tokens, 393216
+    train_max_seq_len: int = 128 * 16  # 2048 max per sequence
+    val_batch_size: int = 4 * 64 * 1024 * 8  # 2097152
     # optimization
     num_iterations: int = 1705  # number of iterations to run
     cooldown_frac: int = (
